@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <!-- Sets the text that appears in the browser tab -->
+    <title>Sleep Annotator</title>
+
+    <!-- Imports the Plotly library used to draw the interactive timeline graph -->
+    <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+
+    <style>
+        /* =========================================
+           CSS STYLING SECTION
+           ========================================= */
+
+        /* Wrapper for the video player to keep its sizing consistent */
+        .video-container {
+            position: relative;
+            display: inline-block;
+            margin-bottom: 20px;
+            border: 1px solid #ccc;
+            padding: 15px;
+            background: #f9f9f9;
+            width: 640px;
+            border-radius: 8px;
+        }
+
+        /* The floating text box that displays the current sleeping position over the video */
+        #position-overlay {
+            position: absolute;
+            bottom: 50px;
+            left: 30px;
+            padding: 5px 10px;
+            color: white;
+            background: rgba(0,0,0,0.8);
+            font-weight: bold;
+            display: none; /* Hidden by default until a video is loaded */
+            pointer-events: none; /* Ensures mouse clicks pass through it to the video controls */
+            border-radius: 4px;
+        }
+
+        /* Basic styling for the editable log table */
+        table {
+            border-collapse: collapse;
+            margin-bottom: 10px;
+            width: 100%;
+            max-width: 600px;
+        }
+
+        th, td {
+            border: 1px solid #ccc;
+            padding: 5px;
+            text-align: left;
+        }
+
+        /* Styling for the live-updating statistics panel */
+        .info-panel {
+            border: 1px solid #333;
+            padding: 15px;
+            background: #e9e9e9;
+            max-width: 640px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+
+            .info-panel p {
+                margin: 5px 0;
+            }
+
+        /* Changes the mouse cursor to a pointer when hovering over the graph to indicate it is clickable */
+        #output-graph {
+            cursor: pointer;
+            margin-top: 20px;
+        }
+
+        /* Styling for the local file selection area above the video */
+        .local-file-picker {
+            margin-bottom: 15px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #ddd;
+        }
+
+        /* Styling for the initial upload screen box */
+        .step-box {
+            border: 1px dashed #999;
+            padding: 15px;
+            max-width: 640px;
+            background: #fff;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+
+    {# Defines the universal color scheme for the application using Jinja.
+    This ensures the graph bars and the video overlay match perfectly. #}
+    {% set COLOR_MAP = {
+    'Back': '#00cc00', 'Right Side': '#0088ff', 'Left Side': '#aa00ff',
+    'Front': '#ff9900', 'No Person Detected': '#ff0000'
+    } %}
+
+    <h1>Sleep Annotator</h1>
+
+    <!-- Displays error messages passed down from the Python backend -->
+    {% if error %}
+    <p style="color: red; font-weight: bold;">{{ error }}</p>
+    {% endif %}
+
+    <!-- =========================================
+         STARTUP SCREEN
+         Visible only when no data has been loaded yet.
+         ========================================= -->
+    {% if not has_data %}
+    <div class="step-box">
+        <form method="POST" enctype="multipart/form-data">
+            <h3>Step 1: Upload Log File</h3>
+            <p><input type="file" name="log_file" accept=".txt, .csv" required></p>
+            <button type="submit" name="action" value="upload" style="padding: 8px 16px; font-weight: bold; cursor: pointer;">Process Log</button>
+        </form>
+        <hr style="border: 0; border-bottom: 1px solid #eee; margin: 20px 0;">
+        <h3 style="color: #666;">Step 2: Sync Video</h3>
+        <p style="color: #666;"><em>(The local video selector will appear here automatically after you process the log file above.)</em></p>
+    </div>
+    {% endif %}
+
+    <!-- =========================================
+         MAIN APPLICATION INTERFACE
+         Visible only after the log file is successfully processed.
+         ========================================= -->
+    {% if has_data %}
+
+    <!-- Link to reset the application and start over -->
+    <div style="margin-bottom: 20px;">
+        <a href="/" style="text-decoration: none; color: blue;">&larr; Upload a different log file</a>
+    </div>
+
+    <!-- Video Player Section -->
+    <div class="video-container">
+        <div class="local-file-picker">
+            <h3 style="margin-top: 0;">Step 2: Sync Video</h3>
+            <input type="file" id="local-video-file" accept="video/*" style="margin-bottom: 5px;">
+            <br><small style="color: #555;"><em>Loads instantly from your hard drive. No uploading required.</em></small>
+        </div>
+
+        <video id="sleep-video" width="640" controls style="display: none; background: #000;"></video>
+        <div id="position-overlay">Awaiting playback...</div>
+    </div>
+
+    <!-- Live Readout Panel -->
+    <div class="info-panel">
+        <h3 style="margin-top: 0;">Active Segment Information</h3>
+        <p><strong>Posture Classification:</strong> <span id="info-posture">N/A</span></p>
+        <p><strong>Start Time:</strong> <span id="info-start">N/A</span></p>
+        <p><strong>End Time:</strong> <span id="info-end">N/A</span></p>
+        <p><strong>Duration:</strong> <span id="info-duration">N/A</span></p>
+    </div>
+
+    <!-- Container where the Plotly timeline graph is drawn -->
+    <div id="output-graph"></div>
+
+    <!-- Statistical Summary Section -->
+    <h3>Summary</h3>
+    <p>Total time logged: <span id="total-time-display">{{ total_time }}</span></p>
+    <ul id="summary-list">
+        {% for row in summary_data %}
+        <li>{{ row['Position'] }}: {{ row['%'] }}% ({{ row['Duration_Str'] }})</li>
+        {% endfor %}
+    </ul>
+
+    <hr>
+
+    <!-- Interactive Data Editing Table -->
+    <h3>Edit Annotation Timeline</h3>
+    <form id="edit-form">
+        <table>
+            <thead>
+                <tr>
+                    <th style="width: 250px;">Time</th>
+                    <th style="width: 200px;">Position</th>
+                    <th style="width: 80px;">Action</th>
+                </tr>
+            </thead>
+            <tbody id="log-tbody">
+                <!-- Jinja loops through the raw log data to pre-populate the table rows -->
+                {% for row in raw_log_data %}
+                <tr>
+                    <td><input type="text" name="start" value="{{ row['Start'] }}" style="width: 90%;" required></td>
+                    <td>
+                        <select name="position">
+                            {% for pos in COLOR_MAP.keys() %}
+                            {% if row['Position'] == pos %}
+                            <option value="{{ pos }}" selected>{{ pos }}</option>
+                            {% else %}
+                            <option value="{{ pos }}">{{ pos }}</option>
+                            {% endif %}
+                            {% endfor %}
+                        </select>
+                    </td>
+                    <td><button type="button" onclick="this.closest('tr').remove()">Delete</button></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Buttons to modify the table and save changes via AJAX -->
+        <button type="button" onclick="addRow()">+ Add Event</button>
+        <button type="submit" id="save-btn" style="font-weight: bold; margin-left: 20px;">Save & Update Graph</button>
+    </form>
+
+    <script>
+            // =========================================
+            // JAVASCRIPT LOGIC SECTION
+            // =========================================
+
+            // Import variables safely from Python/Jinja into standard JavaScript variables
+            const colorMap = {{ COLOR_MAP | tojson }};
+            let stints = {{ stints_json | safe }};
+
+            // Define the layout rules for the Plotly graph
+            const layout = { showlegend: false, xaxis: { type: 'date' }, margin: { l: 150 } };
+
+            // ******************************************************
+            // Initialize Plotly Graph
+            // ******************************************************
+            function drawGraph() {
+                const trace = {
+                    type: 'bar',
+                    orientation: 'h',                 // Creates a horizontal bar chart
+                    y: stints.map(s => s.Position),   // Y-Axis labels (the postures)
+                    base: stints.map(s => s.Start_Str), // The starting point of each bar on the timeline
+                    x: stints.map(s => s.Duration_Ms),  // The length of each bar in milliseconds
+                    marker: { color: stints.map(s => colorMap[s.Position] || '#999') }, // Applies the COLOR_MAP colors
+                    hoverinfo: 'text',
+                    hovertext: stints.map(s => `${s.Position}\nStart: ${s.Start_Str}\nEnd: ${s.End_Str}`), // The tooltip when hovered
+                    textposition: 'none'
+                };
+                // Plotly.react updates the graph efficiently without completely destroying the old one
+                Plotly.react('output-graph', [trace], layout);
+            }
+            // Draw the graph immediately when the page loads
+            drawGraph();
+
+            // ******************************************************
+            // Handle loading the video locally (No Server Uploads)
+            // ******************************************************
+            const videoInput = document.getElementById('local-video-file');
+            const video = document.getElementById('sleep-video');
+            const overlay = document.getElementById('position-overlay');
+            let objectUrl = null;
+
+            // Listens for the user to select a video file
+            videoInput.addEventListener('change', function(e) {
+                const file = e.target.files[0];
+                if (file) {
+                    // Revoke the old URL to free up browser memory if a previous video was loaded
+                    if (objectUrl) URL.revokeObjectURL(objectUrl);
+
+                    // Create a direct virtual link to the file on the user's hard drive
+                    objectUrl = URL.createObjectURL(file);
+                    video.src = objectUrl;
+                    video.style.display = 'block';
+                    overlay.style.display = 'block';
+                }
+            });
+
+            // ******************************************************
+            // Handle Seamless Form Submission (AJAX Background Request)
+            // ******************************************************
+            document.getElementById('edit-form').addEventListener('submit', function(e) {
+                e.preventDefault(); // Prevents the browser from reloading the page!
+
+                const saveBtn = document.getElementById('save-btn');
+                saveBtn.textContent = 'Saving...'; // Visual feedback for the user
+
+                // Package all the table inputs into a form payload
+                const formData = new FormData(this);
+                formData.append('action', 'update');
+
+                // Send the data to the Python backend
+                fetch('/', {
+                    method: 'POST',
+                    body: formData,
+                    headers: { 'Accept': 'application/json' } // Tells Python we want JSON back, not HTML
+                })
+                .then(response => response.json())
+                .then(data => {
+                    // 1. Overwrite the old stints data and redraw the Graph
+                    stints = data.stints_json;
+                    drawGraph();
+
+                    // 2. Update the Summary text dynamically
+                    document.getElementById('total-time-display').textContent = data.total_time;
+                    const ul = document.getElementById('summary-list');
+                    ul.innerHTML = '';
+                    data.summary_data.forEach(row => {
+                        const li = document.createElement('li');
+                        li.textContent = `${row.Position}: ${row['%']}% (${row.Duration_Str})`;
+                        ul.appendChild(li);
+                    });
+
+                    // 3. Rebuild the Table (This ensures the table is sorted chronologically if the user added items out of order)
+                    const tbody = document.getElementById('log-tbody');
+                    tbody.innerHTML = '';
+                    data.raw_log_data.forEach(row => {
+                        let optionsHTML = '';
+                        for (const pos in colorMap) {
+                            optionsHTML += `<option value="${pos}" ${row.Position === pos ? 'selected' : ''}>${pos}</option>`;
+                        }
+
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td><input type="text" name="start" value="${row.Start}" style="width: 90%;" required></td>
+                            <td><select name="position">${optionsHTML}</select></td>
+                            <td><button type="button" onclick="this.closest('tr').remove()">Delete</button></td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+
+                    // 4. Reset the save button text
+                    saveBtn.textContent = 'Saved!';
+                    setTimeout(() => saveBtn.textContent = 'Save & Update Graph', 2000);
+                })
+                .catch(error => {
+                    alert("Error saving data. Check console for details.");
+                    console.error('Save error:', error);
+                    saveBtn.textContent = 'Save & Update Graph';
+                });
+            });
+
+            // ******************************************************
+            // Timeline Appending Logic
+            // ******************************************************
+            function addRow() {
+                const tbody = document.getElementById('log-tbody');
+                const tr = document.createElement('tr');
+
+                // Generate the dropdown options dynamically based on the COLOR_MAP
+                let optionsHTML = '';
+                for (const pos in colorMap) {
+                    optionsHTML += `<option value="${pos}">${pos}</option>`;
+                }
+
+                // Inject the new row HTML structure
+                tr.innerHTML = `
+                    <td><input type="text" name="start" placeholder="2026-08-15 23:00:00" style="width: 90%;" required></td>
+                    <td><select name="position">${optionsHTML}</select></td>
+                    <td><button type="button" onclick="this.closest('tr').remove()">Delete</button></td>
+                `;
+                tbody.appendChild(tr);
+            }
+
+            // Grab references to the Live Information Panel HTML elements
+            const infoPosture = document.getElementById('info-posture');
+            const infoStart = document.getElementById('info-start');
+            const infoEnd = document.getElementById('info-end');
+            const infoDuration = document.getElementById('info-duration');
+
+            // Listen for clicks on the Plotly graph to seek the video
+            document.getElementById('output-graph').on('plotly_click', function(data) {
+                if (data.points.length > 0) {
+                    const pointIndex = data.points[0].pointIndex;
+                    const clickedStint = stints[pointIndex];
+                    // Seek the video to the relative start time of the clicked segment
+                    if (clickedStint && video.src) {
+                        video.currentTime = clickedStint.Start_Relative;
+                        video.play();
+                    }
+                }
+            });
+
+            // ******************************************************
+            // Real-Time Video Synchronization Engine
+            // ******************************************************
+            video.addEventListener('timeupdate', () => {
+                const currentTime = video.currentTime;
+
+                // Find which stint matches the current playback time of the video
+                const activeStint = stints.find(s => currentTime >= s.Start_Relative && currentTime < s.End_Relative);
+
+                if (activeStint) {
+                    // Update the video overlay
+                    overlay.textContent = activeStint.Position;
+                    overlay.style.backgroundColor = colorMap[activeStint.Position];
+
+                    // Update the text in the Active Segment Information panel
+                    infoPosture.textContent = activeStint.Position;
+                    infoStart.textContent = activeStint.Start_Str;
+                    infoEnd.textContent = activeStint.End_Str;
+                    infoDuration.textContent = activeStint.Duration_Str;
+                } else {
+                    // Fallback state if the video is currently playing outside the known log data
+                    overlay.textContent = "No Position Data";
+                    overlay.style.backgroundColor = "black";
+
+                    infoPosture.textContent = "N/A";
+                    infoStart.textContent = "N/A";
+                    infoEnd.textContent = "N/A";
+                    infoDuration.textContent = "N/A";
+                }
+            });
+    </script>
+    {% endif %}
+
+</body>
+</html>
